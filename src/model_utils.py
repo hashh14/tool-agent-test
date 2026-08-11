@@ -2,17 +2,18 @@ import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct"):
+def load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", device="cuda"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="cuda")
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
+    model = model.to(device)
     model.eval()
     return model, tokenizer
 
 
 def build_continuation(function_name, arguments):
     call_dict = {"name": function_name, "arguments": arguments}
-    continuation = ' <functioncall> ' + json.dumps(call_dict)
-    return continuation
+    return ' <functioncall> ' + json.dumps(call_dict)
 
 
 def get_target_token_position(tokenizer, prompt_text, continuation_text, target_value):
@@ -34,11 +35,11 @@ def get_target_token_position(tokenizer, prompt_text, continuation_text, target_
     return encoding, token_positions
 
 
-def extract_activation(model, tokenizer, prompt_text, continuation_text, target_value, layer=12):
+def extract_activation(model, tokenizer, prompt_text, continuation_text, target_value, layer=12, device="cuda"):
     encoding, token_positions = get_target_token_position(tokenizer, prompt_text, continuation_text, target_value)
     if encoding is None:
         return None
-    input_ids = encoding['input_ids'].to("cuda")
+    input_ids = encoding['input_ids'].to(device)
     with torch.no_grad():
         outputs = model(input_ids, output_hidden_states=True)
     layer_activations = outputs.hidden_states[layer][0]
