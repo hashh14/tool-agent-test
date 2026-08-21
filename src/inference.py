@@ -62,3 +62,55 @@ def check_tool_call_grounding(model, tokenizer, clf, context, function_name, arg
         print(f"\n{'⚠️  Recommend human review before execution.' if any_flagged else '✅ All arguments appear grounded.'}")
 
     return results
+
+def check_tool_call_complete(model, tokenizer, clf_grounding, clf_disambig, context, function_name, arguments,
+                               candidate_map=None, grounding_threshold=0.5, disambig_threshold=0.7, disambig_margin=0.15,
+                               layer_grounding=12, layer_disambig=18, device="cuda"):
+    """
+    Complete grounding + disambiguation check for a proposed tool call.
+    candidate_map: optional dict {arg_name: [candidate_values]} for arguments where
+                   multiple plausible values might exist in context (only checked for these).
+    Returns a per-argument verdict: 'grounded', 'ungrounded' (likely fabricated),
+    'clarify' (multiple competing grounded candidates), or 'abstain'.
+    """
+    from model_utils import build_continuation, extract_activation
+
+    continuation = build_continuation(function_name, arguments)
+    results = {}
+
+    for arg_name, arg_value in arguments.items():
+        act = extract_activation(model, tokenizer, context, continuation, arg_value, layer=layer_grounding, device=device)
+        if act is None:
+            results[arg_name] = {'verdict': 'abstain', 'reason': 'could not extract activation'}
+            continue
+        grounding_prob = clf_grounding.predict_proba(act.numpy().reshape(1, -1))[0, 1]
+
+        if grounding_prob < grounding_threshold:
+            results[arg_name] = {'verdict': 'ungrounded', 'grounding_score': float(grounding_prob),
+                                  'note': 'likely fabricated - no supporting evidence found'}
+            continue
+
+        if candidate_map and arg_name in candidate_map:
+            candidates = candidate_map[arg_name]
+            cand_scores = {}
+            for cand in candidates:
+                cand_args = {arg_name: cand}
+                cand_continuation = build_continuation(function_name, cand_args)
+                cand_act = extract_activation(model, tokenizer, context, cand_continuation, cand, layer=layer_disambig, device=device)
+                if cand_act is None:
+                    continue
+                cand_scores[str(cand)] = float(clf_disambig.predict_proba(cand_act.numpy().reshape(1, -1))[0, 1])
+
+            if len(cand_scores) > 1:
+                sorted_scores = sorted(cand_scores.items(), key=lambda x: -x[1])
+                top_cand, top_score = sorted_scores[0]
+                second_cand, second_score = sorted_scores[1]
+                if top_score >= disambig_threshold and second_score >= disambig_threshold and (top_score - second_score) < disambig_margin:
+                    results[arg_name] = {'verdict': 'clarify', 'grounding_score': float(grounding_prob),
+                                          'competing_candidates': cand_scores,
+                                          'note': f'multiple values ({list(cand_scores.keys())}) appear grounded - ask user to confirm'}
+                    continue
+
+        results[arg_name] = {'verdict': 'grounded', 'grounding_score': float(grounding_prob)}
+
+    return results
