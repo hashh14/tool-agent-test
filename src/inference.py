@@ -114,3 +114,53 @@ def check_tool_call_complete(model, tokenizer, clf_grounding, clf_disambig, cont
         results[arg_name] = {'verdict': 'grounded', 'grounding_score': float(grounding_prob)}
 
     return results
+
+def check_tool_call_complete_v2(model, tokenizer, clf_grounding, clf_disambig, context, function_name, arguments,
+                                   candidate_map=None, grounding_threshold=0.5, disambig_threshold=0.5, disambig_margin=0.15,
+                                   layer_grounding=12, layer_disambig=18, device="cuda"):
+    """
+    v2: checks disambiguation candidates FIRST for any argument with a candidate_map entry,
+    since a low single-value grounding score can itself be a symptom of ambiguity (not fabrication).
+    Only falls through to a pure grounding check when no candidates are specified for that argument.
+    """
+    from model_utils import build_continuation, extract_activation
+
+    continuation = build_continuation(function_name, arguments)
+    results = {}
+
+    for arg_name, arg_value in arguments.items():
+        if candidate_map and arg_name in candidate_map:
+            candidates = candidate_map[arg_name]
+            cand_scores = {}
+            for cand in candidates:
+                cand_args = {arg_name: cand}
+                cand_continuation = build_continuation(function_name, cand_args)
+                cand_act = extract_activation(model, tokenizer, context, cand_continuation, cand, layer=layer_disambig, device=device)
+                if cand_act is None:
+                    continue
+                cand_scores[str(cand)] = float(clf_disambig.predict_proba(cand_act.numpy().reshape(1, -1))[0, 1])
+
+            if len(cand_scores) > 1:
+                sorted_scores = sorted(cand_scores.items(), key=lambda x: -x[1])
+                top_cand, top_score = sorted_scores[0]
+                second_cand, second_score = sorted_scores[1]
+                if top_score < disambig_threshold:
+                    results[arg_name] = {'verdict': 'ungrounded', 'candidate_scores': cand_scores,
+                                          'note': 'no candidate scores as grounded'}
+                elif second_score >= disambig_threshold and (top_score - second_score) < disambig_margin:
+                    results[arg_name] = {'verdict': 'clarify', 'candidate_scores': cand_scores,
+                                          'note': f'multiple values ({list(cand_scores.keys())}) appear grounded - ask user to confirm'}
+                else:
+                    results[arg_name] = {'verdict': 'grounded', 'candidate_scores': cand_scores, 'chosen': top_cand}
+                continue
+
+        # no candidates specified for this argument - plain grounding check
+        act = extract_activation(model, tokenizer, context, continuation, arg_value, layer=layer_grounding, device=device)
+        if act is None:
+            results[arg_name] = {'verdict': 'abstain', 'reason': 'could not extract activation'}
+            continue
+        grounding_prob = clf_grounding.predict_proba(act.numpy().reshape(1, -1))[0, 1]
+        verdict = 'grounded' if grounding_prob >= grounding_threshold else 'ungrounded'
+        results[arg_name] = {'verdict': verdict, 'grounding_score': float(grounding_prob)}
+
+    return results
